@@ -1,5 +1,9 @@
 # maimai-android-touch-panel
 
+本项目为 [ERR0RPR0MPT/maimai-android-touch-panel](https://github.com/ERR0RPR0MPT/maimai-android-touch-panel/) 的 rust 实现版本（开发中）
+
+## maimai-android-touch-panel 原项目 README
+
 使用 `adb shell getevent` 记录 Android 设备触屏事件并模拟 maimai 触摸屏幕的脚本.
 
 ## 提示

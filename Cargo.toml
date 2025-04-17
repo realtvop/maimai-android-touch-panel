@@ -1,0 +1,15 @@
+[package]
+name = "maimai-android-touch-panel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serialport = "4.2" # For serial communication
+serde = { version = "1.0", features = ["derive"] } # For deserialization
+serde_yaml = "0.9" # For YAML parsing
+image = "0.24" # For image loading and manipulation
+once_cell = "1.18" # Replaces lazy_static for static initialization
+crossbeam-channel = "0.5" # High-performance channels
+thiserror = "1.0" # For error handling
+hex = "0.4" # For hex encoding/decoding
+# Add other potential dependencies like 'clap' for args, 'anyhow' for error handling

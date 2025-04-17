@@ -8,3 +8,8 @@
 /config_wec.yaml
 /config_zgh.yaml
 /start_zgh.bat
+
+
+# Added by cargo
+
+/target
