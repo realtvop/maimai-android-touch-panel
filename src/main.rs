@@ -1,16 +1,14 @@
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use serialport::SerialPort;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // --- Configuration ---
 
@@ -34,10 +32,6 @@ struct Config {
     android_abs_input_size: [u32; 2],
     #[serde(rename = "ANDROID_REVERSE_MONITOR")]
     android_reverse_monitor: bool,
-    #[serde(rename = "TOUCH_THREAD_SLEEP_MODE")]
-    touch_thread_sleep_mode: bool, // Note: This name might be misleading in Rust context
-    #[serde(rename = "TOUCH_THREAD_SLEEP_DELAY")]
-    touch_thread_sleep_delay: u64, // Microseconds
     #[serde(rename = "SPECIFIED_DEVICES")]
     specified_devices: Option<String>,
     exp_image_dict: HashMap<String, String>,
@@ -85,12 +79,8 @@ enum AppError {
     Image(#[from] image::ImageError),
     #[error("Hex decoding error: {0}")]
     Hex(#[from] hex::FromHexError),
-    #[error("Channel send error: {0}")]
-    SendError(String),
     #[error("ADB command failed")]
     AdbCommand,
-    #[error("Invalid ADB output format")]
-    AdbFormat,
 }
 
 // --- Types ---
@@ -206,91 +196,106 @@ fn serial_manager(
         .open()?;
     println!("Opened serial port {} at {} baud", port_name, baud_rate);
 
-    let mut setting_packet = [40u8, 0, 0, 0, 0, 41];
-    let mut start_up = Arc::new(AtomicBool::new(false));
-    let mut last_sent_packet = Vec::new();
+    // Shared state for connection status
+    let start_up = Arc::new(AtomicBool::new(false));
+    // Local state for the writing loop
+    let last_sent_packet = Arc::new(Mutex::new(Vec::<u8>::new())); // Store last packet to send periodically
     let mut last_printed_keys: Vec<String> = Vec::new();
 
-    let start_up_clone = start_up.clone();
-    let mut port_clone = port.try_clone()?; // Clone for reading thread
+    // --- Serial Reading Thread ---
+    { // Scope for thread-related variables
+        let start_up_clone = start_up.clone();
+        let mut port_clone = port.try_clone()?; // Clone for reading thread
+        let mut setting_packet = [40u8, 0, 0, 0, 0, 41]; // Keep setting packet logic local to reader
 
-    // Serial Reading Thread
-    thread::spawn(move || {
-        let mut read_buf = [0u8; 6]; // Expect 6 bytes
-        loop {
-            match port_clone.read(&mut read_buf) {
-                Ok(bytes_read) if bytes_read == 6 => {
-                    // Process received data (touch_setup logic)
-                    let byte_data = read_buf[3];
-                    // println!("Received: {:?}", &read_buf[..bytes_read]); // Debug
-                    if byte_data == 76 || byte_data == 69 { // L or E
-                        start_up_clone.store(false, Ordering::Relaxed);
-                        // println!("Game connection stopped.");
-                    } else if byte_data == 114 || byte_data == 107 { // r or k
-                        for i in 1..5 {
-                            setting_packet[i] = read_buf[i];
-                        }
-                        if let Err(e) = port_clone.write_all(&setting_packet) {
-                             eprintln!("Error writing settings packet: {}", e);
-                        }
-                    } else if byte_data == 65 { // A
-                        if !start_up_clone.load(Ordering::Relaxed) {
-                             println!("已连接到游戏");
-                             start_up_clone.store(true, Ordering::Relaxed);
+        thread::spawn(move || {
+            let mut read_buf = [0u8; 6]; // Expect 6 bytes
+            loop {
+                match port_clone.read(&mut read_buf) {
+                    Ok(bytes_read) if bytes_read == 6 => {
+                        let byte_data = read_buf[3];
+                        if byte_data == 76 || byte_data == 69 { // L or E
+                            if start_up_clone.swap(false, Ordering::Relaxed) {
+                                println!("游戏连接已断开");
+                            }
+                        } else if byte_data == 114 || byte_data == 107 { // r or k
+                            for i in 1..5 {
+                                setting_packet[i] = read_buf[i];
+                            }
+                            if let Err(e) = port_clone.write_all(&setting_packet) {
+                                eprintln!("Error writing settings packet: {}", e);
+                            }
+                        } else if byte_data == 65 { // A
+                            if !start_up_clone.swap(true, Ordering::Relaxed) {
+                                println!("已连接到游戏");
+                            }
                         }
                     }
+                    Ok(_) => {} // Incomplete read
+                    Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {} // Expected timeout
+                    Err(e) => {
+                        eprintln!("Serial read error: {}", e);
+                        start_up_clone.store(false, Ordering::Relaxed); // Assume disconnected on error
+                        thread::sleep(Duration::from_secs(1)); // Wait before retrying or exiting
+                    }
                 }
-                Ok(_) => {} // Incomplete read, ignore for now
-                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {} // Expected timeout
-                Err(e) => {
-                    eprintln!("Serial read error: {}", e);
-                    // Consider adding logic to attempt reconnection or exit
-                    thread::sleep(Duration::from_secs(1));
-                }
+                thread::sleep(Duration::from_millis(1)); // Prevent busy-waiting
             }
-             // Small sleep to prevent busy-waiting if no data
-             thread::sleep(Duration::from_millis(1));
-        }
-    });
+        });
+    } // End of scope for thread variables
 
 
-    // Serial Writing Loop (main thread for this function)
+    // --- Serial Writing Loop (main thread for this function) ---
     loop {
-        // Check for new commands, non-blocking
-        if let Ok((packet, keys)) = cmd_rx.try_recv() {
-             if packet != last_sent_packet {
-                 last_sent_packet = packet.clone();
-                 if start_up.load(Ordering::Relaxed) {
-                     if let Err(e) = port.write_all(&last_sent_packet) {
-                         eprintln!("Serial write error: {}", e);
-                         // Handle error, maybe try to reopen port?
-                     }
-                 }
-                 // Print keys only if they changed
-                 let mut sorted_keys = keys.clone();
-                 sorted_keys.sort(); // Sort for consistent comparison
-                 if sorted_keys != last_printed_keys {
-                     println!("Touch Keys: {:?}", sorted_keys);
-                     last_printed_keys = sorted_keys;
-                 }
-             }
-        } else {
-             // If no new command, potentially resend last packet if needed,
-             // or just sleep briefly. The Python version seems to rely on
-             // continuous updates from getevent.
-             // If start_up is true and last_sent_packet is not empty,
-             // we could resend it periodically, but let's stick closer
-             // to the Python logic for now which sends on change.
-             thread::sleep(Duration::from_micros(100)); // Small sleep to avoid busy loop
+        let mut packet_to_send: Option<Vec<u8>> = None;
+        let mut keys_changed = false;
+
+        // 1. Check for new commands immediately
+        if let Ok((new_packet, keys)) = cmd_rx.try_recv() {
+            let mut last_packet_guard = last_sent_packet.lock().unwrap();
+            if *last_packet_guard != new_packet {
+                *last_packet_guard = new_packet.clone();
+                packet_to_send = Some(new_packet); // Prioritize sending the new packet
+
+                // Update and print keys if they changed
+                let mut sorted_keys = keys;
+                sorted_keys.sort();
+                if sorted_keys != last_printed_keys {
+                    println!("Touch Keys: {:?}", sorted_keys);
+                    last_printed_keys = sorted_keys;
+                }
+                keys_changed = true;
+            }
         }
 
-        // Optional sleep based on config (though less common in Rust)
-        // if CONFIG.touch_thread_sleep_mode {
-        //     thread::sleep(Duration::from_micros(CONFIG.touch_thread_sleep_delay));
-        // }
+        // 2. If no new packet received, prepare to send the last known packet periodically
+        if !keys_changed {
+             let last_packet_guard = last_sent_packet.lock().unwrap();
+             if !last_packet_guard.is_empty() {
+                 // Clone the packet to send outside the lock
+                 packet_to_send = Some(last_packet_guard.clone());
+             }
+        }
+
+
+        // 3. Send if connected and there's a packet to send
+        if start_up.load(Ordering::Relaxed) {
+            if let Some(packet) = packet_to_send {
+                 if let Err(e) = port.write_all(&packet) {
+                    eprintln!("Serial write error: {}", e);
+                    start_up.store(false, Ordering::Relaxed); // Assume disconnected on write error
+                    // Consider adding logic to attempt reconnection
+                 }
+            }
+        }
+
+        // 4. Sleep to control send rate (adjust as needed)
+        // This ensures periodic sending even if no new touch events occur.
+        // Match the Python version's effective rate (which depends on loop overhead + sleep)
+        // A small delay like 5-10ms might be appropriate.
+        thread::sleep(Duration::from_millis(5)); // Send roughly every 5ms if connected
     }
 }
-
 
 // --- ADB Event Listener ---
 
@@ -334,10 +339,15 @@ fn adb_event_listener(cmd_tx: crossbeam_channel::Sender<SerialCommand>) -> Resul
         });
     }
 
-
     let mut touch_data: TouchData = vec![TouchPoint::default(); CONFIG.max_slot];
     let mut current_slot = 0;
-    let mut key_is_changed = false;
+    // Send initial empty state on startup
+    if let Ok(initial_command) = convert_touch_data(&touch_data) {
+         if let Err(e) = cmd_tx.send(initial_command) {
+             eprintln!("Failed to send initial state: {}", e);
+         }
+    }
+    let mut key_is_changed = false; // Reset after sending initial state
 
     for line in reader.lines() {
         let line = line?;
@@ -454,10 +464,10 @@ fn main() -> Result<()> {
     println!("Screen reverse initially: {}", ANDROID_REVERSE_MONITOR.load(Ordering::Relaxed));
 
     // Create channels for communication
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SerialCommand>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<SerialCommand>(100);
 
     // --- Start Threads ---
-    let serial_thread = {
+    let _serial_thread = {
         let port_name = CONFIG.com_port.clone();
         let baud_rate = CONFIG.com_baudrate;
         thread::spawn(move || {
@@ -467,7 +477,7 @@ fn main() -> Result<()> {
         })
     };
 
-    let adb_thread = {
+    let _adb_thread = {
         let cmd_tx_clone = cmd_tx.clone();
          thread::spawn(move || {
             loop { // Loop to attempt reconnection on ADB failure
